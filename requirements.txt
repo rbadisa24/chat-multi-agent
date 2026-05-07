@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+pydantic
+langchain-core
+langchain-openai
+langgraph
+httpx
+python-dotenv
+litellm 
+mcp
+langchain-mcp-adapters
+a2a
+a2a-sdk
+starlette
+
