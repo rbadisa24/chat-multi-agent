@@ -1,0 +1,237 @@
+# Task: Harden the SSE event generator in this file
+
+You are modifying an existing FastAPI + LangGraph SSE streaming endpoint that
+emits AG-UI protocol events. The generator function is `_sse_event_generator`
+(around line 1657). Currently, when a `JSONDecodeError` or other exception
+fires mid-stream, the generator dies without emitting a clean `RUN_ERROR`
+frame. The frontend sees `ERR_INCOMPLETE_CHUNKED_ENCODING` and shows a generic
+network-error dialog instead of a proper agent-error dialog.
+
+Fix this. Below are the specific issues to address, the constraints you must
+respect, and the acceptance criteria.
+
+-----
+
+## Constraints (do not violate)
+
+1. **Logging**: Use ONLY `loggingHelper.log(...)` with the existing
+   `ThreadLogParams` / `GraphLogParams` shapes. Do NOT introduce
+   `logging.getLogger`, `logger.warning`, `logger.exception`, or any other
+   generic Python logging. The codebase has a single sanctioned logging path.
+1. **Minimal new functions**: The file is already 1800 lines. Add at most ONE
+   new helper function, and only if it removes meaningful duplication
+   (≥3 call sites). Otherwise inline.
+1. **Preserve all existing names**: `ThreadLogParams`, `GraphLogParams`,
+   `env_loader`, `loggingHelper`, `prompt_throttler`, `connection_manager`,
+   `agent_service`, `executor`, `redact_string`, `_get_event_field`,
+   `_should_filter_raw_event`, `_extract_text_chunk`, `SSEStreamContext`. Do
+   not rename, do not refactor signatures.
+1. **Preserve existing error code values**: `E1040` (client disconnect),
+   `E1041` (stream cancelled), `E1020` (generic error). You may add new codes
+   in the E10xx range for new failure classes.
+1. **Function signature unchanged**: `async def _sse_event_generator(agent, run_input, request: Request, stream_ctx: SSEStreamContext, log_ctx: dict, encoder)` — drop-in replacement for the current implementation.
+1. **No `except Exception: pass`**: Every caught exception must be logged via
+   `loggingHelper.log` with a specific error code. The ONLY exception is the
+   meta-case where logging itself raises inside an exception handler — that
+   single `pass` is permitted and must carry a comment explaining why no
+   recovery is possible.
+1. **Re-raise framework signals**: `asyncio.CancelledError` and `GeneratorExit`
+   must never be swallowed by broad `except Exception` clauses. Re-raise them
+   explicitly when they appear.
+
+-----
+
+## Critical issues to fix
+
+### Issue 1: Per-event work is not isolated (root cause of the symptom)
+
+The `async for event in agent.run(run_input):` loop calls `encoder.encode`,
+`_get_event_field`, `_extract_text_chunk`, `_should_filter_raw_event`. Any of
+these can raise `JSONDecodeError`, `ValueError`, or `TypeError` for a single
+malformed event, which currently kills the entire stream.
+
+**Fix**: Wrap the per-event body in `try/except (JSONDecodeError, ValueError, TypeError)`. On catch, log a WARNING via `loggingHelper` with error code
+`E1021` and `continue`. A bad event becomes a skipped event, not a dead
+stream.
+
+### Issue 2: RUN_ERROR frame can be blocked by logging failure
+
+Currently, the `except Exception as stream_exc:` block constructs
+`ThreadLogParams` and calls `loggingHelper.log(...)` BEFORE yielding the
+`RUN_ERROR` frame. If logging crashes (missing `log_ctx` key, serialization
+issue), the yields never execute and the client gets
+`ERR_INCOMPLETE_CHUNKED_ENCODING`.
+
+**Fix**: In the `except Exception` handler, yield the `RUN_ERROR` frame FIRST,
+then log. The terminal frame must reach the client before any auxiliary work.
+
+### Issue 3: RUN_FINISHED is emitted after RUN_ERROR
+
+Per AG-UI protocol, `RUN_ERROR` is itself terminal. Emitting `RUN_FINISHED`
+after it puts the frontend state machine in an ambiguous state.
+
+**Fix**: Remove the `RUN_FINISHED` yield from the error path. Only one
+terminal frame per run on failure: `RUN_ERROR`.
+
+### Issue 4: No stream_end sentinel
+
+The frontend cannot distinguish a clean server close from a connection drop.
+Both look like `done: true` from the fetch reader.
+
+**Fix**: In the `finally` block, before cleanup, yield exactly:
+`"event: stream_end\ndata: {}\n\n"`. Wrap in a try/except that logs failure
+via `loggingHelper` with error code `E1024` (“could not deliver stream_end
+sentinel — client likely already disconnected”). The frontend uses sentinel
+absence to detect connection drops.
+
+### Issue 5: CancelledError handler is too heavy
+
+Asyncio expects cancellation to be fast. The current handler runs ~15 lines
+of structured logging synchronously before re-raising. Heavy work in a
+cancellation path can itself get cancelled, leaving partial state.
+
+**Fix**: Keep one `loggingHelper.log` call (WARNING, code `E1041`,
+`_thread_log_params(...)`) then `raise`. The detailed structured completion
+log moves to the `finally` block where it has time to run.
+
+### Issue 6: Cleanup steps cascade-fail and have no timeouts
+
+Currently in the `finally` block, `prompt_throttler.release_slot()`,
+`connection_manager.remove_connection()`, `stream_ctx.graph.destroy_graph()`,
+and `env_loader.clear_user_session()` all run sequentially. If any hangs or
+raises, subsequent steps may not execute.
+
+**Fix**:
+
+- Each cleanup step in its own try/except.
+- The two awaited cleanups bounded by `asyncio.wait_for(..., timeout=2.0)`.
+- On exception, log via `loggingHelper` with distinct error codes per step:
+  - `E1030` — throttler timeout
+  - `E1031` — throttler other error
+  - `E1032` — connection_manager timeout
+  - `E1033` — connection_manager other error
+  - `E1034` — graph destroy failed
+  - `E1035` — clear_user_session failed
+  - `E1036` — Mongo persistence (executor.submit) failed
+
+### Issue 7: Error sentinel pollutes Mongo conversation history
+
+On error, `accumulated_response.append("[ERROR] Agent streaming failed.")`
+runs, then the finally block writes the full accumulated string to Mongo as
+the assistant turn. Failed runs persist `"[ERROR] ..."` as if it were
+assistant content.
+
+**Fix**: Track a `had_error: bool` flag (set to `True` in any exception
+handler that represents a real failure — Exception or CancelledError). In the
+finally block, skip the `executor.submit(agent_service.record_message_in_mongo, ...)` call when `had_error` is True. Do NOT append the error sentinel string
+to `accumulated_response` at all.
+
+### Issue 8: Disconnect check fires every event
+
+`await request.is_disconnected()` per event is meaningful overhead under fast
+token streaming, and can itself raise on some Starlette versions.
+
+**Fix**: Throttle the check — check every 10 events using a counter. Wrap the
+call in try/except so a failed disconnect check doesn’t kill the stream;
+log via `loggingHelper` with error code `E1042` if it fails.
+
+### Issue 9: Generic E1020 for all backend exceptions
+
+All exceptions in the outer handler currently get `errorCode="E1020"`,
+making triage hard.
+
+**Fix**: Classify exceptions inline in the `except Exception` block:
+
+- `JSONDecodeError`, `ValueError`, `TypeError` → code `E1021`, user message
+  “The assistant received an unexpected response. Please try again.”
+- `asyncio.TimeoutError`, `TimeoutError` → code `E1022`, user message
+  “The assistant took too long to respond. Please try again.”
+- Anything else → code `E1020`, user message
+  “The assistant encountered an error. Please try again.”
+
+The user message goes in the RUN_ERROR JSON payload as `message`. The error
+code goes in the JSON payload as `code` AND in the `errorCode` field of the
+ThreadLogParams. Do not put internal exception text in the user-facing
+message — only the predefined strings above.
+
+-----
+
+## The one helper you may add
+
+Because the ~15-field `ThreadLogParams(...)` block is duplicated 4+ times in
+the current code, you may extract:
+
+```python
+def _thread_log_params(log_ctx, prompt_id, errors=None, error_code=None):
+    return ThreadLogParams(
+        threadId=log_ctx.get("threadId", ""),
+        elid=log_ctx.get("elid", ""),
+        ppid=log_ctx.get("ppid", ""),
+        subFirm=log_ctx.get("subfirm", ""),
+        promptId=prompt_id,
+        wsConnRequestDT=log_ctx.get("wsConnRequestDT", ""),
+        wsConnEstablishedDT=log_ctx.get("wsConnEstablishedDT", ""),
+        wsConnDisconnectDT=datetime.datetime.now(datetime.UTC).isoformat() + "Z",
+        model=env_loader.get_model(),
+        toolCalls="", totalLatency="", promptLatency="", firstByte="", lastByte="",
+        transactionId=log_ctx.get("transactionId", ""),
+        spanId=log_ctx.get("spanId", ""),
+        loggingFunctionName="langgraph_agent_endpoint.event_generator",
+        errors=errors,
+        errorCode=error_code,
+    )
+```
+
+Note `.get()` everywhere — a missing context key must NOT crash error-path
+logging. Use this helper at every site that currently builds
+`ThreadLogParams` inline.
+
+`GraphLogParams` is used only once (the per-event DEBUG log) — leave it
+inline, do not extract.
+
+-----
+
+## Acceptance criteria
+
+The refactored generator must satisfy ALL of the following:
+
+1. A single malformed LangGraph event raising `JSONDecodeError` results in
+   that event being skipped + a WARNING log; the stream continues normally.
+1. An unrecoverable exception in the outer scope yields exactly one terminal
+   frame: `RUN_ERROR` with the appropriate code and user message. No
+   `RUN_FINISHED` follows.
+1. The `RUN_ERROR` frame is yielded BEFORE any error-path logging executes.
+1. A `stream_end` sentinel frame is yielded in the `finally` block, before
+   cleanup steps run. Failure to deliver it is logged with code `E1024`.
+1. `asyncio.CancelledError` is caught with minimal work, logged once with
+   code `E1041` via `_thread_log_params`, and re-raised.
+1. `GeneratorExit` is never swallowed by `except Exception` — if you catch
+   it explicitly, you must re-raise.
+1. Every cleanup step in `finally` is independently wrapped, awaited cleanups
+   are bounded by `asyncio.wait_for(..., timeout=2.0)`, and every catch logs
+   via `loggingHelper` with the specified error codes (E1030–E1036).
+1. `had_error` flag prevents Mongo persistence of failed runs.
+1. `accumulated_response` never has error sentinel strings appended to it.
+1. Disconnect check runs at most once per 10 events, wrapped to not kill
+   the stream on failure (logs E1042).
+1. Exception classification produces distinct error codes (E1020/E1021/E1022)
+   and corresponding user-facing messages from a fixed set.
+1. Only ONE bare `pass` exists in the file: inside the meta-case where
+   `loggingHelper.log` itself raised inside an exception handler. It must
+   carry a comment explaining why recovery is impossible at that point.
+1. Function signature, names of imports, and external behavior on the
+   happy path are unchanged.
+
+-----
+
+## Deliverable
+
+Output the complete refactored `_sse_event_generator` function plus the new
+`_thread_log_params` helper, ready to drop into the existing file. Include a
+brief change summary at the top as a docstring comment, listing which of the
+9 issues above each section of the code addresses. Do not output the entire
+1800-line file — only the replacement function and helper.
+
+After the code, list any assumptions you had to make and any places where the
+existing code’s behavior was ambiguous and you chose a specific
+interpretation.
