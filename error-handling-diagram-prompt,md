@@ -1,0 +1,285 @@
+# Task: Generate runtime sequence diagrams from this codebase
+
+You will analyze an existing codebase and produce two sequence diagrams that
+show actual runtime behavior across multiple scenarios — happy path, contained
+failures, escalated failures, and connection drops. Both Mermaid and
+Excalidraw outputs.
+
+These diagrams are intended for architecture review, onboarding, and
+production incident debugging. They must reflect what the code ACTUALLY does,
+not idealized behavior.
+
+-----
+
+## Phase 1 — Codebase analysis (do this BEFORE drawing anything)
+
+Before producing any diagram, complete this analysis. Output your findings as
+a structured report.
+
+### 1.1 Identify the components (lifelines)
+
+Scan the codebase and list every component that participates in a request’s
+lifecycle. For each, capture:
+
+- **Component name** (the class/module name as it appears in code)
+- **File path and key entry points** (function/method names)
+- **Layer** (frontend / transport / orchestration / agent / tool / persistence / cross-cutting)
+- **Owns what state** (connections, retries, timeouts, error budgets, etc.)
+
+Aim for 6–10 lifelines. Too few = diagram is too abstract. Too many =
+unreadable. If the codebase has more than 10 candidate components, group
+related ones (e.g., “Tool layer” instead of listing each tool).
+
+### 1.2 Identify the failure modes
+
+Scan for every place the code catches an exception, emits an error event,
+times out, retries, or makes an escalation decision. For each, capture:
+
+- **Where**: file path + line number
+- **Trigger**: what condition causes it (exception type, timeout, business rule)
+- **Response**: retry / fallback / propagate / convert-to-error-event / silent
+- **Crosses a boundary?**: does this failure produce a frame, log, metric, or
+  exception that crosses into another component’s lifeline?
+
+This is the most important part of the analysis. The quality of the diagrams
+depends on understanding the failure surface. Do not skip or rush this step.
+
+### 1.3 Identify the protocol contracts
+
+What guarantees does the codebase provide between components? Look for:
+
+- Terminal frame guarantees on streams (RUN_FINISHED, RUN_ERROR, etc.)
+- Sentinels or markers indicating clean closure
+- Heartbeat / keepalive mechanisms
+- Structured error returns vs raised exceptions
+- Cancellation propagation mechanisms
+- Correlation IDs that flow through the call chain
+
+Quote the relevant code snippets. If a contract is implicit (no test, no
+comment), flag it as such.
+
+### 1.4 Choose scenarios
+
+Based on 1.2 and 1.3, choose 3–5 scenarios that together exercise the
+interesting parts of the system. A good scenario set:
+
+- **One happy path** — establishes the baseline of what success looks like
+- **One contained failure** — something fails internally but the user-visible
+  outcome is still a successful run (with possible degradation indicator)
+- **One escalated failure** — something fails fatally; user sees an error
+- **One transport/network failure** — the protocol itself fails (connection
+  drop, no terminal frame possible)
+- **Optional: one cancellation** — user aborts mid-stream
+
+For each scenario, write a one-sentence summary and identify which lifelines
+participate. If the codebase doesn’t support a scenario (e.g., no
+cancellation handling exists), say so explicitly rather than inventing it.
+
+-----
+
+## Phase 2 — Diagram generation
+
+Only after Phase 1 is complete, produce the two diagrams.
+
+### 2.1 Mermaid sequence diagram
+
+Requirements:
+
+- Use `sequenceDiagram` with `autonumber`
+- Declare every lifeline with `participant` (use short aliases for arrow lines)
+- Wrap each scenario in a `rect rgb(...)` block with the color coding below
+- Use `Note over` for architectural insights and contract callouts — not just
+  to repeat what an arrow says
+- Use `activate` / `deactivate` to show nesting (component is “active” during
+  a sub-call)
+- Use `loop` blocks for repeated events (e.g., per-token streaming)
+- Use `--x` for exception throws, `-->>` for async/return, `->>` for sync calls
+- Reference real function names, file paths, and error codes from the
+  codebase — do not invent them
+
+Color palette for scenario bands:
+
+|Scenario type    |RGB               |When to use                             |
+|-----------------|------------------|----------------------------------------|
+|Happy path       |rgb(211, 249, 216)|Clean successful execution              |
+|Contained failure|rgb(255, 244, 230)|Recovered internally, run still succeeds|
+|Escalated failure|rgb(255, 227, 227)|Fatal — user sees error                 |
+|Network/transport|rgb(231, 245, 255)|Connection-level failure                |
+|Cancellation     |rgb(243, 240, 255)|User-initiated abort                    |
+
+Output the Mermaid file as a complete `.mmd` document with:
+
+- Header comment listing scenarios and their tags
+- Brief comment block per scenario explaining what makes it interesting
+
+### 2.2 Excalidraw JSON sequence diagram
+
+Requirements:
+
+- Generate Excalidraw v2 JSON (importable into excalidraw.com)
+- Lifelines as horizontal labeled boxes at top, vertical dashed lines descending
+- Each scenario gets a colored band divider (full-width labeled rectangle)
+- Messages as horizontal arrows between lifelines, labeled
+- Self-calls as small loop indicators on a single lifeline
+- Notes as colored boxes spanning relevant lifelines
+- Activation bars as thin colored vertical rectangles overlaid on lifelines
+- Color coding matches the Mermaid palette above
+- Solid arrows for sync calls, dashed for returns/async/logging
+- Include a legend at the bottom
+
+Use the following palette (must be consistent with the architecture diagram
+if one exists):
+
+```
+Frontend     bg=#e7f5ff stroke=#1971c2
+Transport    bg=#fff4e6 stroke=#e8590c
+Orchestration bg=#f3f0ff stroke=#6741d9
+Agent layer  bg=#e6fcf5 stroke=#0ca678
+Tool layer   bg=#fff9db stroke=#f08c00
+Cross-cutting bg=#ffe0e6 stroke=#c2255c
+Persistence  bg=#dee2e6 stroke=#495057
+```
+
+Output as a complete JSON object with `type: "excalidraw"`, `version: 2`,
+`source`, `elements: [...]`, `appState`, `files: {}`. Validate that every
+element has the required fields: `id`, `type`, `x`, `y`, `width`, `height`,
+`angle`, `strokeColor`, `backgroundColor`, `fillStyle`, `strokeWidth`,
+`strokeStyle`, `roughness`, `opacity`, `groupIds`, `frameId`, `roundness`,
+`seed`, `version`, `versionNonce`, `isDeleted`, `boundElements`, `updated`,
+`link`, `locked`. Text elements additionally need `text`, `fontSize`,
+`fontFamily`, `textAlign`, `verticalAlign`, `containerId`, `originalText`,
+`lineHeight`, `baseline`. Arrow/line elements need `points`,
+`lastCommittedPoint`, `startBinding`, `endBinding`, `startArrowhead`,
+`endArrowhead`.
+
+Layout guidance:
+
+- Lifelines spaced ~230px apart horizontally
+- Each scenario should fit in 400–700 vertical pixels
+- Total diagram height typically 2000–3000px
+- Title and subtitle at top; legend at bottom
+
+-----
+
+## Phase 3 — Output structure
+
+Deliver in this order:
+
+1. **Phase 1 analysis report** (markdown):
+- Component inventory table
+- Failure mode catalog with file:line references
+- Contract inventory with quoted code
+- Scenario list with one-line summaries
+1. **Mermaid diagram** (`runtime_sequence.mmd` content)
+1. **Excalidraw diagram** (`runtime_sequence.excalidraw` content as JSON)
+1. **Annotations and assumptions**:
+- List any places where the code’s behavior is ambiguous and you made a
+  choice (e.g., “the order of logging vs yielding in the except handler
+  is unclear; I diagrammed it as logging-first based on line 1726”).
+- List any scenarios you DIDN’T diagram because the code doesn’t support
+  them (e.g., “no cancellation handler found; scenario omitted”).
+- List any failure modes you discovered that aren’t currently handled at
+  all (these are bugs the diagrams will surface).
+
+-----
+
+## Constraints
+
+- **Use real names from the codebase**: function names, error codes,
+  exception types, log message text. Do not paraphrase or generalize. If the
+  code says `loggingHelper.log(type="ERROR", errorCode="E1020")`, the diagram
+  says `loggingHelper.log E1020`, not “logger logs an error.”
+- **Reference file paths and line numbers** in the analysis report. Reviewers
+  must be able to trace every diagram element back to source.
+- **Don’t invent failure modes**. If the code doesn’t have a circuit breaker,
+  don’t put one in the diagram. If retries aren’t bounded, say so — don’t
+  invent a bound.
+- **Surface inconsistencies**. If two parts of the codebase handle similar
+  failures differently (e.g., one path emits RUN_ERROR but another silently
+  closes), call this out in the annotations section. The diagrams should
+  reflect what’s actually there, even when it’s inconsistent.
+- **Keep scenarios focused**. Each scenario should illustrate ONE primary
+  failure mode plus its surrounding context. Don’t try to show every possible
+  branch in one scenario.
+- **Activation bars must match call depth**. If component A calls B which
+  calls C, A’s activation bar must visibly span B’s, which spans C’s. This is
+  what makes nested call structures readable.
+- **Notes earn their place**. Use notes for architectural insights, contract
+  callouts, or non-obvious decisions (“★ Tool failure does NOT raise — keeps
+  agent in control of conversation”). Don’t use notes to repeat what an arrow
+  already says.
+- **Color consistency**: a component should appear in the same color
+  everywhere it shows up across both diagrams.
+
+-----
+
+## What good looks like
+
+A successful output:
+
+1. The Phase 1 analysis cites at least 8 specific file:line references for
+   failure modes. Each is a real exception handler or error emission point.
+1. Each scenario in the diagrams has a clear “★ KEY MOMENT” note that
+   explains why the scenario matters architecturally — not just what
+   happens, but what it reveals about the design.
+1. A senior engineer reading the diagrams can predict where to look in the
+   code for any given runtime behavior. The diagrams are a navigation aid,
+   not just documentation.
+1. Inconsistencies and gaps in error handling are visible in the diagrams,
+   not hidden by idealization.
+1. Both Mermaid and Excalidraw outputs are syntactically valid and import
+   cleanly into their respective tools without manual fixup.
+1. The annotations section honestly distinguishes between “what the code
+   does,” “what I had to assume,” and “what’s missing.”
+
+-----
+
+## Failure modes to avoid
+
+Watch out for these common mistakes:
+
+- **Generic lifelines**: “Service” or “Backend” instead of the actual class
+  names. Always use names from the code.
+- **Missing the failure path**: drawing only the happy path. The whole point
+  is to show what happens when things break.
+- **Over-abstraction**: treating retries, timeouts, and circuit breakers as
+  identical “error handling.” They’re different mechanisms with different
+  semantics. Diagram them separately.
+- **Wishful contracts**: assuming guarantees that aren’t in the code.
+  “Sentinel emitted before close” is only true if you can point to the line
+  that emits it.
+- **Color drift**: using different colors for the same component across
+  scenarios. Pick a palette in Phase 1 and hold it for both diagrams.
+- **Invented numbers**: making up timeouts, retry counts, or error codes
+  rather than reading them from config/code.
+- **Skipping Phase 1**: jumping straight to drawing. The analysis is what
+  makes the diagrams useful. If Phase 1 is shallow, the diagrams will be too.
+
+-----
+
+## How to attach the codebase
+
+Paste the relevant source files (or attach them) along with this prompt.
+At minimum, include:
+
+- The main streaming/request entry point
+- Any error handling / classification module
+- The orchestration layer (graph, supervisor, router, etc.)
+- Tool wrapping/execution code
+- Stream/transport layer (SSE, WebSocket, etc.)
+- The frontend stream consumer (if relevant for transport scenario)
+
+If the codebase is large, indicate which directories to focus on and which
+to ignore. Don’t try to diagram every code path — focus on the request
+lifecycle.
+
+-----
+
+## Final reminder
+
+The goal is a diagram that a senior engineer would point at during an
+incident review and say “yes, this is what actually happens.” Not a diagram
+that looks impressive. Not a diagram that shows everything. A diagram that
+is correct, focused, and traceable to source.
+
+Phase 1 first. Always Phase 1 first.
