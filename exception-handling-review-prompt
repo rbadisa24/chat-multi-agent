@@ -1,0 +1,130 @@
+You are a senior software engineer reviewing and improving an agentic AI application.
+
+The application has:
+- React frontend chat interface
+- FastAPI backend
+- LangGraph ReactAgent
+- Tool-calling layer
+- External dependencies such as LLM providers, APIs, databases, vector stores, auth services, and streaming responses
+
+Your task is to inspect the codebase and update it to follow best practices for error handling and exception handling across all layers.
+
+Primary goals:
+1. Identify every meaningful failure mode.
+2. Ensure exceptions are raised at the layer that understands the failure.
+3. Ensure exceptions are caught only at boundaries that can recover, retry, enrich, log, or translate the error.
+4. Prevent raw provider, database, framework, or stack-trace errors from leaking to users.
+5. Make all user-facing errors structured, safe, traceable, and actionable.
+6. Preserve existing behavior unless a change is necessary for correctness or safety.
+
+Review and update the code using this layered model:
+
+Frontend React layer:
+- Handle failed HTTP requests, failed streaming responses, malformed responses, cancellation, auth expiration, and retryable backend failures.
+- Add or improve error boundaries where appropriate.
+- Display user-safe messages only.
+- Preserve trace IDs or request IDs for support/debugging.
+- Distinguish retryable and non-retryable errors in UI state.
+
+FastAPI API boundary:
+- Add centralized exception handlers.
+- Convert application exceptions into consistent HTTP responses.
+- Use a standard error envelope:
+  {
+    "error": {
+      "code": "...",
+      "message": "...",
+      "retryable": true/false,
+      "trace_id": "..."
+    }
+  }
+- Do not let raw exceptions escape to clients.
+- Use HTTPException only for API-bound concerns such as auth, validation, and missing resources.
+- Map domain/application exceptions to appropriate HTTP status codes.
+
+Application/service layer:
+- Define or improve typed application exceptions.
+- Raise domain-specific errors such as ConversationNotFound, InvalidChatState, AgentRunFailed, ToolUnavailable, ToolValidationError, AuthRequired, RateLimited, Timeout, and ExternalDependencyFailed.
+- Do not return error strings as normal successful values.
+- Add context to exceptions without losing the original cause.
+- Use exception chaining where appropriate.
+
+LangGraph / agent layer:
+- Identify where agent execution can fail: recursion limits, tool failures, invalid tool inputs, LLM provider failures, malformed model outputs, timeouts, cancellations, and interrupted streams.
+- Add retries only for transient failures.
+- Avoid retrying validation, permission, policy, or user-input errors.
+- Use LangGraph retry policies, timeouts, or error handlers where appropriate.
+- Let recoverable tool failures become agent-visible observations when the agent can continue.
+- Raise typed AgentRunFailed or equivalent when the agent cannot recover.
+
+Tool layer:
+- Wrap provider-specific exceptions into typed tool/application exceptions.
+- Validate tool input before calling external systems.
+- Clearly distinguish:
+  - invalid tool arguments
+  - auth/permission failure
+  - rate limit
+  - timeout
+  - unavailable dependency
+  - malformed provider response
+  - empty/not found result
+- Avoid leaking SDK-specific exception classes above the tool boundary.
+- Include enough diagnostic context for logs, but not secrets or sensitive user data.
+
+Observability:
+- Ensure every request/agent run has a trace_id or correlation_id.
+- Log errors with structured metadata.
+- Include original exception details in logs, not in user responses.
+- Avoid logging secrets, tokens, full prompts, or sensitive documents.
+- Add metrics or counters where useful for error categories.
+
+Streaming:
+- If the app streams chat responses, handle errors after the stream has started.
+- Use typed stream events such as:
+  - token
+  - tool_start
+  - tool_result
+  - tool_error
+  - final
+  - error
+- Ensure unrecoverable stream failures emit a final structured error event when possible.
+- Ensure the frontend can render partial responses safely.
+
+Testing:
+- Add or update tests for key failure modes.
+- Include tests for:
+  - invalid user input
+  - backend validation failure
+  - tool timeout
+  - tool rate limit
+  - external API failure
+  - malformed tool response
+  - agent failure
+  - streaming failure
+  - frontend retryable error state
+  - frontend non-retryable error state
+- Verify that no raw stack traces or provider errors reach the frontend.
+
+Implementation rules:
+- Keep changes minimal and idiomatic to the existing codebase.
+- Prefer existing project patterns over new abstractions.
+- Introduce a shared error taxonomy only if one does not already exist.
+- Do not swallow exceptions silently.
+- Do not catch broad Exception unless you re-raise, translate, or log with clear intent.
+- Do not add retries without bounded attempts and backoff.
+- Do not retry non-transient failures.
+- Preserve original exceptions using `raise NewError(...) from exc`.
+
+Deliverables:
+1. A short audit of current error-handling gaps.
+2. A proposed layered error-handling design for this codebase.
+3. Code changes implementing the design.
+4. Tests or verification steps proving the behavior.
+5. A final summary explaining:
+   - where exceptions are raised
+   - where exceptions are caught
+   - how errors are translated for the frontend
+   - what failure modes are now covered
+   - what remains out of scope
+
+Before editing, inspect the codebase and identify the actual architecture. Do not assume file names or frameworks beyond what is present. If the implementation differs from the architecture described above, adapt the design to the real code.
